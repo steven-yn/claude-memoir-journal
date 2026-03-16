@@ -75,7 +75,7 @@ Hook → session_cache.py (10초 내 완료)
          session_summarize.py:
            ├─ 임시 파일에서 대화 내용 읽기
            ├─ 프롬프트 조합 (data-analyst + guideline + 세션 데이터 + 출력 포맷)
-           ├─ claude -p "조합된 프롬프트" --model haiku
+           ├─ echo "프롬프트" | claude -p --model haiku (stdin 파이프)
            ├─ 응답을 Level 2 캐시로 저장
            └─ 임시 파일 정리
 ```
@@ -94,7 +94,7 @@ Hook → session_cache.py (10초 내 완료)
 - `guideline.md`의 원칙(누락 없음, 인사이트 중심 등)이 캐시에도 적용
 - 저널 생성 시 data-analyst를 다시 돌리지 않아도 동일한 품질 보장
 
-**대화 내용 추출 범위** (session_cache.py 확장):
+**대화 내용 추출 범위** (session_parser.py의 `parse_session_file` 확장):
 - `user_queries`: 기존과 동일 (최대 20개)
 - `conversation_blocks`: 새로 추가 — 사용자 질문 + 어시스턴트 텍스트 응답을 페어로 추출 (도구 호출 결과 제외)
   - 최대 30개 페어
@@ -152,11 +152,13 @@ collect_sessions.py --check-summary
 
 **일별 / 주별 / 월별 차별화:**
 
-| 유형 | 입력 데이터 | 최적화 포인트 |
-|------|-----------|-------------|
-| 일별 | 해당 날짜 세션들의 Level 2 캐시 | 대부분 캐시 히트 → data-analyst 스킵, 바로 journal-writer |
-| 주별 | 일별 저널 파일들 | 이미 작성된 일별 저널 기반 → 세션 데이터 불필요 |
-| 월별 | 주별 저널 파일들 | 이미 작성된 주별 저널 기반 → 세션 데이터 불필요 |
+| 유형 | 우선 입력 | 폴백 시 |
+|------|----------|---------|
+| 일별 | 해당 날짜 세션들의 Level 2 캐시 | 캐시 미스 세션은 병렬 data-analyst |
+| 주별 | 일별 저널 파일들 | 일별 저널 없는 날짜 → Level 2 캐시 → 병렬 data-analyst |
+| 월별 | 주별 저널 파일들 | 주별 저널 없는 주 → 일별 저널 → Level 2 캐시 → 병렬 data-analyst |
+
+주별/월별도 하위 저널이 없어서 세션 데이터로 폴백할 때 Level 2 캐시를 동일하게 활용한다.
 
 **병렬 처리 상세 (캐시 미스 시):**
 ```
@@ -180,15 +182,24 @@ Level 1 캐시 있음? ──yes──→ 저널 생성 시 data-analyst 실행
 
 어떤 상황에서도 저널 생성이 중단되지 않는다.
 
+**`/clear` 후 재실행:**
+
+`/clear` 후 동일 session_id로 세션이 계속될 수 있다. 이 경우:
+- Level 1 캐시는 `merge_cache`로 기존과 새 데이터를 병합 (기존 동작)
+- Level 2 캐시는 기존 파일을 삭제하고, 병합된 Level 1 데이터를 기반으로 재생성
+
 **백그라운드 요약 실패 케이스:**
 
 | 실패 상황 | 처리 |
 |----------|------|
 | `claude` CLI 없음/인증 만료 | Level 1만 저장, 에러 로그 기록 |
-| 120초 타임아웃 초과 | 프로세스 종료, Level 1으로 폴백 |
+| 자체 타임아웃 초과 | 프로세스 종료, Level 1으로 폴백 |
 | 응답이 JSON 파싱 불가 | Level 1만 유지, 다음 저널 생성 시 재분석 |
-| 이미 Level 2 존재 (`/clear` 후 재실행) | 기존 Level 2 삭제 후 재생성 (병합된 Level 1 기반) |
 | 세션이 너무 짧음 (`summary_min_queries` 미만) | 요약 스킵 |
+
+**자체 타임아웃:**
+
+`session_summarize.py`는 `signal.SIGALRM`을 사용하여 `summary_timeout` + 10초 후 자동 종료한다. claude CLI의 `timeout` 파라미터와 별개로, 프로세스 전체가 무한히 걸리는 것을 방지한다.
 
 ### 5. 설정 추가
 
@@ -205,12 +216,14 @@ Level 1 캐시 있음? ──yes──→ 저널 생성 시 data-analyst 실행
 
 | 파일 | 변경 유형 | 내용 |
 |------|----------|------|
-| `scripts/session_cache.py` | 수정 | conversation_blocks 추출 추가, 백그라운드 프로세스 spawn |
-| `scripts/session_summarize.py` | 신규 | 백그라운드 요약 스크립트 (claude CLI 호출) |
+| `scripts/session_parser.py` | 수정 | `parse_session_file`에 `conversation_blocks` 추출 추가 |
+| `scripts/session_cache.py` | 수정 | 대화 내용 임시 파일 저장, 백그라운드 프로세스 spawn |
+| `scripts/session_summarize.py` | 신규 | 백그라운드 요약 스크립트 (claude CLI 호출, lock, 로깅, 타임아웃) |
 | `scripts/collect_sessions.py` | 수정 | `--check-summary` 플래그 추가, Level 2 캐시 로드 |
 | `scripts/journal_config.py` | 수정 | 새 설정 키 추가 |
 | `commands/daily.md` | 수정 | 캐시 히트/미스 분기, 병렬 에이전트, 병합 로직 |
-| `commands/weekly.md` | 수정 | 일별 저널 우선 참조 로직 |
-| `commands/monthly.md` | 수정 | 주별 저널 우선 참조 로직 |
+| `commands/weekly.md` | 수정 | 일별 저널 + Level 2 캐시 우선 참조 로직 |
+| `commands/monthly.md` | 수정 | 주별 저널 + Level 2 캐시 우선 참조 로직 |
+| `commands/status.md` | 수정 | Level 2 캐시 현황 표시 |
 | `hooks/hooks.json` | 확인 | 기존 훅 유지 (session_cache.py가 백그라운드 spawn 담당) |
 | `agents/data-analyst.md` | 확인 | 기존 유지, 백그라운드 요약에서도 재활용 |
