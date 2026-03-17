@@ -128,7 +128,7 @@ def build_prompt(plugin_root: Path, conv_data: dict) -> str:
 
 def run_claude(prompt: str, model: str, timeout: int) -> str:
     result = subprocess.run(
-        ["claude", "-p", "--model", model, "--output-format", "text"],
+        ["claude", "-p", "--no-session-persistence", "--model", model, "--output-format", "text"],
         input=prompt,
         capture_output=True,
         text=True,
